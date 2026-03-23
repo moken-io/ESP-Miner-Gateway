@@ -437,6 +437,11 @@ int platform_http_request(const char *url,
     int status = -1;
     if (err == ESP_OK) {
         status = esp_http_client_get_status_code(client);
+    } else {
+        bool timed_out = (errno == ETIMEDOUT || errno == EAGAIN);
+        ESP_LOGW("gw_plat", "HTTP request failed: %s (errno=%d%s)",
+                 esp_err_to_name(err), errno, timed_out ? ", timeout" : "");
+        if (timed_out) status = -2;  /* caller can distinguish timeout from error */
     }
 
     esp_http_client_cleanup(client);

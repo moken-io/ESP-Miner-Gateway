@@ -98,6 +98,14 @@ void gateway_core_on_ws_disconnected(void)
 
 void gateway_core_on_message(const char *data, int len)
 {
+    /* tRPC reconnect notification: {"id":null,"method":"reconnect"}
+     * wslink ignores server-initiated messages (id is not a number), so we
+     * handle it here.  Closing the WS lets gateway_core_run reconnect cleanly. */
+    if (len > 20 && strstr(data, "\"method\":\"reconnect\"")) {
+        GW_LOGW(TAG, "Server requested reconnect — closing WS");
+        platform_ws_disconnect();
+        return;
+    }
     wslink_on_message(g_wslink, data, len);
 }
 
@@ -146,6 +154,11 @@ static void handle_scan_ip_range(const char *command_id, cJSON *payload)
     g_gw->scan_state.scanning       = true;
     g_gw->scan_state.stop_requested = false;
 
+    /* Parse probe timeout from payload; default 100 ms. */
+    cJSON *probe_timeout_item = cJSON_GetObjectItem(payload, "probeTimeoutMs");
+    int probe_timeout_ms = (cJSON_IsNumber(probe_timeout_item) && probe_timeout_item->valuedouble >= 10)
+        ? (int)probe_timeout_item->valuedouble : 100;
+
     /* Parse ports array from payload; default to [80, 4028]. */
     cJSON *ports_item = cJSON_GetObjectItem(payload, "ports");
     int port_list[16];
@@ -189,7 +202,7 @@ static void handle_scan_ip_range(const char *command_id, cJSON *payload)
         snprintf(cidr_buf + len, sizeof(cidr_buf) - len, "/%d", prefix);
     }
 
-    GW_LOGI(TAG, "Starting scan: %s (%d ports)", cidr_buf, port_count);
+    GW_LOGI(TAG, "Starting scan: %s (%d ports, probe_timeout=%d ms)", cidr_buf, port_count, probe_timeout_ms);
 
     /* Parse CIDR */
     uint32_t base_ip = 0;
@@ -228,12 +241,12 @@ static void handle_scan_ip_range(const char *command_id, cJSON *payload)
             if (g_gw->scan_state.stop_requested) {
                 results[pi] = false;
             } else {
-                results[pi] = platform_tcp_probe(ip_str, port_list[pi], 20);
+                results[pi] = platform_tcp_probe(ip_str, port_list[pi], probe_timeout_ms);
                 if (results[pi]) any_open = true;
             }
         }
 
-        if (any_open) {
+        {
             cJSON *r     = cJSON_CreateObject();
             cJSON *ports = cJSON_CreateObject();
             cJSON_AddStringToObject(r, "ip", ip_str);
@@ -243,8 +256,10 @@ static void handle_scan_ip_range(const char *command_id, cJSON *payload)
             }
             cJSON_AddItemToObject(r, "ports", ports);
             send_command_result(command_id, true, r, NULL, true);
-            found++;
-            GW_LOGI(TAG, "Probe %s: alive", ip_str);
+            if (any_open) {
+                found++;
+                GW_LOGI(TAG, "Probe %s: alive", ip_str);
+            }
         }
     }
 
@@ -291,8 +306,11 @@ static void handle_http_request(const char *command_id, cJSON *payload)
     int status = platform_http_request(url, method, body, resp_buf, 8192, timeout_ms);
     if (status < 0) {
         free(resp_buf);
-        char err[128];
-        snprintf(err, sizeof(err), "HTTP %.10s %.100s failed", method, url);
+        char err[144];
+        if (status == -2)
+            snprintf(err, sizeof(err), "HTTP %.10s %.100s timed out (%d ms)", method, url, timeout_ms);
+        else
+            snprintf(err, sizeof(err), "HTTP %.10s %.100s failed", method, url);
         send_command_result(command_id, false, NULL, err, false);
         return;
     }
@@ -549,7 +567,8 @@ static void on_command_event(wslink_result_type_t type, cJSON *data,
 
     case WSLINK_RESULT_STOPPED:
         g_authenticated = false;
-        GW_LOGW(TAG, "onCommand subscription stopped by server");
+        GW_LOGW(TAG, "onCommand subscription stopped by server — closing WS to reconnect");
+        platform_ws_disconnect();
         break;
 
     case WSLINK_RESULT_ERROR:
@@ -628,7 +647,7 @@ void gateway_core_run(void)
             platform_ws_service();
             platform_delay_ms(100);
 
-            if (++tick >= 300) {   /* every 30 s */
+            if (++tick >= 100) {   /* every 10 s */
                 GW_LOGI(TAG, "Connected (auth=%s, heap=%u)",
                         g_authenticated ? "yes" : "pending",
                         (unsigned)platform_get_free_heap());
