@@ -221,16 +221,19 @@ static void handle_scan_ip_range(const char *command_id, cJSON *payload)
     }
     parse_ipv4(ip_part, &base_ip);
 
-    if (prefix < 16 || prefix > 30) prefix = 24;  /* safety clamp */
+    if (prefix < 16 || prefix > 32) prefix = 24;  /* safety clamp */
     uint32_t host_bits = (uint32_t)(32 - prefix);
-    uint32_t num_hosts = (1u << host_bits) - 2u;   /* exclude net + broadcast */
+    /* /32 = single host, /31 = 2 hosts (point-to-point), else exclude net+broadcast */
+    uint32_t num_hosts = (prefix >= 31) ? (1u << host_bits) : (1u << host_bits) - 2u;
     uint32_t net_addr  = base_ip & ~((1u << host_bits) - 1u);
+    /* /32: scan the exact IP; /31: start from offset 0; else skip network addr */
+    uint32_t start_offset = (prefix >= 31) ? 0u : 1u;
 
     int found = 0;
     char ip_str[16];
     char port_key[8];
 
-    for (uint32_t i = 1; i <= num_hosts; i++) {
+    for (uint32_t i = start_offset; i < start_offset + num_hosts; i++) {
         if (g_gw->scan_state.stop_requested) break;
 
         ip_to_str(net_addr + i, ip_str, sizeof(ip_str));
@@ -395,6 +398,12 @@ static void handle_mac_lookup(const char *command_id, cJSON *payload)
         return;
     }
 
+    /* Self-MAC shortcut: ARP table never contains own entry */
+    char local_mac[20] = "";
+    char local_ip_str[16] = "";
+    platform_get_mac_str(local_mac, sizeof(local_mac));
+    platform_get_local_ip(local_ip_str, sizeof(local_ip_str));
+
     /* Check ARP cache for all MACs up front */
     int remaining = 0;
     for (int mi = 0; mi < mac_count; mi++) {
@@ -404,8 +413,15 @@ static void handle_mac_lookup(const char *command_id, cJSON *payload)
         if (cJSON_IsString(m)) {
             strncpy(entries[mi].mac, m->valuestring, sizeof(entries[mi].mac) - 1);
             entries[mi].mac[sizeof(entries[mi].mac) - 1] = '\0';
-            entries[mi].found = platform_arp_mac_to_ip(
-                entries[mi].mac, entries[mi].ip, sizeof(entries[mi].ip));
+            if (local_mac[0] && local_ip_str[0] &&
+                strcasecmp(entries[mi].mac, local_mac) == 0) {
+                /* Own MAC — return local IP directly */
+                strncpy(entries[mi].ip, local_ip_str, sizeof(entries[mi].ip) - 1);
+                entries[mi].found = true;
+            } else {
+                entries[mi].found = platform_arp_mac_to_ip(
+                    entries[mi].mac, entries[mi].ip, sizeof(entries[mi].ip));
+            }
         } else {
             entries[mi].mac[0] = '\0';
             entries[mi].found  = true; /* skip invalid */
@@ -509,7 +525,16 @@ static void handle_ip_lookup(const char *command_id, cJSON *payload)
     }
 
     char mac_buf[18] = "";
-    bool found = platform_arp_ip_to_mac(ip, mac_buf, sizeof(mac_buf));
+    char local_ip[32] = "";
+    platform_get_local_ip(local_ip, sizeof(local_ip));
+    bool found;
+    if (strcmp(ip, local_ip) == 0) {
+        /* Requesting own IP — ARP table never contains self, use local MAC */
+        platform_get_mac_str(mac_buf, sizeof(mac_buf));
+        found = mac_buf[0] != '\0';
+    } else {
+        found = platform_arp_ip_to_mac(ip, mac_buf, sizeof(mac_buf));
+    }
 
     cJSON *result = cJSON_CreateObject();
     if (found)

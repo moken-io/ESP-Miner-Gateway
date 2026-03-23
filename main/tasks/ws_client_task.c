@@ -80,55 +80,60 @@ void ws_client_task(void *pvParameters)
     ESP_LOGI(TAG, "WebSocket client task started");
 
     // ── Resolve credentials ──────────────────────────────────────────────────
-    const char *client_id     = get_credential(EMBEDDED_CLIENT_ID,     "HASHLY_CID:");
-    const char *client_secret = get_credential(EMBEDDED_CLIENT_SECRET, "HASHLY_SEC:");
-    const char *ws_url        = get_credential(EMBEDDED_WS_URL,        "HASHLY_URL:");
+    // Priority: NVS (web UI / user-configured) → embedded (binary-patched default).
+    // This lets operators override credentials via the web UI without reflashing.
 
-    // Fall back to NVS when running with placeholder firmware (dev builds)
-    bool url_is_placeholder = strstr(ws_url, "__PLACEHOLDER") != NULL;
-    bool cid_is_placeholder = strstr(client_id, "__PLACEHOLDER") != NULL;
-    bool sec_is_placeholder = strstr(client_secret, "__PLACEHOLDER") != NULL;
+    const char *client_id;
+    const char *client_secret;
+    const char *ws_url;
 
-    if (url_is_placeholder || cid_is_placeholder || sec_is_placeholder) {
-        ESP_LOGW(TAG, "Embedded credentials are placeholders — falling back to NVS");
+    char *nvs_cid = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLIENT_ID);
+    if (nvs_cid && *nvs_cid) {
+        client_id = nvs_cid;  // intentional leak — lives for lifetime of task
+        ESP_LOGI(TAG, "client_id: NVS");
+    } else {
+        free(nvs_cid);
+        client_id = get_credential(EMBEDDED_CLIENT_ID, "HASHLY_CID:");
+        ESP_LOGI(TAG, "client_id: embedded");
+    }
 
-        if (url_is_placeholder) {
-            char *nvs_url = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLOUD_URL);
-            if (nvs_url && *nvs_url) {
-                ws_url = nvs_url;  // intentional leak — used for lifetime of task
-            } else {
-                if (nvs_url) free(nvs_url);
-                ESP_LOGE(TAG, "No WebSocket URL configured. Flash firmware with embedded credentials.");
-                while (1) vTaskDelay(pdMS_TO_TICKS(30000));
-            }
-        }
+    char *nvs_sec = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLOUD_API_KEY);
+    if (nvs_sec && *nvs_sec) {
+        client_secret = nvs_sec;  // intentional leak
+        ESP_LOGI(TAG, "client_secret: NVS");
+    } else {
+        free(nvs_sec);
+        client_secret = get_credential(EMBEDDED_CLIENT_SECRET, "HASHLY_SEC:");
+        ESP_LOGI(TAG, "client_secret: embedded");
+    }
 
-        if (cid_is_placeholder) {
-            char *nvs_cid = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLIENT_ID);
-            if (nvs_cid && *nvs_cid) {
-                client_id = nvs_cid;  // intentional leak — used for lifetime of task
-            } else {
-                if (nvs_cid) free(nvs_cid);
-                ESP_LOGW(TAG, "No client ID configured in NVS");
-            }
-        }
+    char *nvs_url = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLOUD_URL);
+    if (nvs_url && *nvs_url) {
+        ws_url = nvs_url;  // intentional leak
+        ESP_LOGI(TAG, "ws_url: NVS (%s)", ws_url);
+    } else {
+        free(nvs_url);
+        ws_url = get_credential(EMBEDDED_WS_URL, "HASHLY_URL:");
+        ESP_LOGI(TAG, "ws_url: embedded (%s)", ws_url);
+    }
 
-        if (sec_is_placeholder) {
-            char *nvs_sec = nvs_config_get_string(NVS_CONFIG_GATEWAY_CLOUD_API_KEY);
-            if (nvs_sec && *nvs_sec) {
-                client_secret = nvs_sec;  // intentional leak — used for lifetime of task
-            } else {
-                if (nvs_sec) free(nvs_sec);
-                ESP_LOGW(TAG, "No client secret configured in NVS");
-            }
-        }
+    // Fail fast if URL is still an unpatched placeholder
+    if (strstr(ws_url, "__PLACEHOLDER") != NULL) {
+        ESP_LOGE(TAG, "No WebSocket URL configured. Set via web UI or flash with embedded credentials.");
+        while (1) vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+    if (strstr(client_id, "__PLACEHOLDER") != NULL) {
+        ESP_LOGW(TAG, "No client ID configured — connection will likely be rejected");
+    }
+    if (strstr(client_secret, "__PLACEHOLDER") != NULL) {
+        ESP_LOGW(TAG, "No client secret configured — connection will likely be rejected");
     }
 
     // Store resolved client_id for ws_client_get_client_id()
     s_resolved_client_id = client_id;
 
     // ── Initialise and run gateway core ──────────────────────────────────────
-    const char *version = "1.1.0";
+    const char *version = "1.1.3";
 
     GatewayConfig cfg = {
         .client_id     = client_id,
